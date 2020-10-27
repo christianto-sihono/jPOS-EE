@@ -1,6 +1,6 @@
 /*
  * jPOS Project [http://jpos.org]
- * Copyright (C) 2000-2013 Alejandro P. Revilla
+ * Copyright (C) 2000-2020 jPOS Software SRL
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU Affero General Public License as
@@ -19,13 +19,14 @@
 package org.jpos.ee;
 
 import java.util.Date;
+
 import org.jpos.util.Logger;
 import org.jpos.util.LogEvent;
 import org.hibernate.Transaction;
 
+
 @SuppressWarnings("unused")
-public class SysLogManager {
-    DB db;
+public class SysLogManager extends DBManager<SysLog> {
     boolean autoCommit;
 
     /**
@@ -33,8 +34,7 @@ public class SysLogManager {
      * (open/begin/commit/close is not required).
      */
     public SysLogManager () {
-        super ();
-        db = new DB();
+        super (new DB(),SysLog.class);
         autoCommit = true;
     }
 
@@ -45,8 +45,7 @@ public class SysLogManager {
      * @param db the DB instance
      */
     public SysLogManager (DB db) {
-        super();
-        this.db = db;
+        super(db,SysLog.class);
         autoCommit = false;
     }
 
@@ -56,8 +55,7 @@ public class SysLogManager {
      * @param autoCommit true if we want this manager to auto-commit log events
      */
     public SysLogManager (DB db, boolean autoCommit) {
-        super();
-        this.db = db;
+        super(db, SysLog.class);
         this.autoCommit = autoCommit;
     }
 
@@ -161,12 +159,13 @@ public class SysLogManager {
     }
     public SysLog get (long id) {
         try {
-            return (SysLog)
-                db.session().load (SysLog.class, new Long (id));
+            return db.session().load (SysLog.class, new Long (id));
         } catch (Throwable e) {
             db.getLog().error (e);
         } 
         return null;
     }
+
+
 }
 

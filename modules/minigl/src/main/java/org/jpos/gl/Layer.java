@@ -1,6 +1,6 @@
 /*
  * jPOS Project [http://jpos.org]
- * Copyright (C) 2000-2013 Alejandro P. Revilla
+ * Copyright (C) 2000-2020 jPOS Software SRL
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU Affero General Public License as
@@ -19,18 +19,17 @@
 package org.jpos.gl;
 
 import java.io.Serializable;
-import org.apache.commons.lang.builder.EqualsBuilder;
-import org.apache.commons.lang.builder.HashCodeBuilder;
-import org.apache.commons.lang.builder.ToStringBuilder;
+import org.apache.commons.lang3.builder.EqualsBuilder;
+import org.apache.commons.lang3.builder.HashCodeBuilder;
+import org.apache.commons.lang3.builder.ToStringBuilder;
 
 import java.text.ParseException;
-import org.jdom.Element;
-import org.jdom.Comment;
+import org.jdom2.Element;
 
 /** 
  * Journal level layer information.
 */
-public class Layer implements Serializable {
+public class Layer extends org.jpos.ee.Cloneable implements Serializable, Comparable {
     private short id;
     private String name;
     private org.jpos.gl.Journal journal;
@@ -100,6 +99,11 @@ public class Layer implements Serializable {
         Element e = new Element ("layer").setText(getName());
         e.setAttribute ("id", Short.toString(getId()));
         return e;
+    }
+
+    @Override
+    public int compareTo(Object o) {
+        return Short.compare(getId(), ((Layer)o).getId());
     }
 }
 

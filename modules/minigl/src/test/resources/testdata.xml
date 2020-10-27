@@ -7,6 +7,13 @@
   <nick>apr</nick>
   <name>Alejandro Revilla</name>
  </user>
+ <user>
+  <nick>travis</nick>
+  <name>Travis build</name>
+  <grant>read</grant>
+  <grant>write</grant>
+  <grant>grant</grant>
+ </user>
 
  <!-- ADD YOUR username here -->
  
@@ -53,7 +60,7 @@
     <account code="113" type="debit">
      <description>Bank Account</description>
     </account>
-    <account code="120" type="debit">
+    <account code="114" type="debit">
      <description>Trip Fund</description>
     </account>
    </composite-account>
@@ -83,6 +90,15 @@
   <composite-account code="5" type="debit" >
    <description>Losses</description>
   </composite-account>
+  <composite-account code="6">
+   <description>Order</description>
+   <composite-account code="61" type="debit" >
+    <description>Order debit</description>
+   </composite-account>
+   <composite-account code="62" type="credit" >
+    <description>Order credit</description>
+   </composite-account>
+  </composite-account>
  </chart-of-accounts>
 
  <!--
@@ -104,12 +120,15 @@
   <grant user="bob">post</grant>
   <grant user="bob">checkpoint</grant>
   <grant user="bob">summarize</grant>
+  <grant user="travis">post</grant>
+  <grant user="travis">checkpoint</grant>
+  <grant user="travis">summarize</grant>
   <rule clazz="org.jpos.gl.rule.CanPost">
    Verify permissions, start/end dates, status, and chart
   </rule>
   <rule clazz="org.jpos.gl.rule.DoubleEntry">
    Verify that credits equals debits
-   <layers>0,1</layers>
+   <layers>0</layers>
   </rule>
   <rule clazz="org.jpos.gl.rule.CompositeMaxBalance" account="1">
     Check assets doesn't go above one million
@@ -122,8 +141,8 @@
   </rule>
   <rule clazz="org.jpos.gl.rule.CompositeMinBalance" account="11">
     Check that the account has always a balance greater than 45000.00
-    <param>45000.00</param>
-    <layers>0,1</layers>
+    <param>-45000.00</param>
+    <layers>0,1,2</layers>
   </rule>
   <rule clazz="org.jpos.gl.rule.FinalMaxBalance" account="31">
     Put a limit to Bob's equity
@@ -140,12 +159,15 @@
   <grant user="bob">post</grant>
   <grant user="bob">checkpoint</grant>
   <grant user="bob">summarize</grant>
+  <grant user="travis">post</grant>
+  <grant user="travis">checkpoint</grant>
+  <grant user="travis">summarize</grant>
   <rule clazz="org.jpos.gl.rule.CanPost">
    Verifies permissions, start/end dates, status, and chart
   </rule>
   <rule clazz="org.jpos.gl.rule.DoubleEntry">
    Verify that credits equals debits
-   <param>0.1</param>
+   <layers>0</layers>
   </rule>
  </journal>
 
@@ -164,12 +186,12 @@
    <amount>10000.00</amount>
   </entry>
   <!-- a Virtual entry in Layer 1 - trip fund -->
-  <entry account="120" type="debit" layer="1">
+  <entry account="114" type="debit" layer="1">
    <detail>Bob Check #001 20% to Trip Fund</detail>
    <amount>2000.00</amount>
   </entry>
   <!-- a Virtual entry in Layer 2 - trip budget -->
-  <entry account="120" type="credit" layer="2">
+  <entry account="114" type="credit" layer="2">
    <detail>Trip Budget 50000</detail>
    <amount>50000.00</amount>
   </entry>

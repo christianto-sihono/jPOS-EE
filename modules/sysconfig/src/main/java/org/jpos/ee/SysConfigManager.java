@@ -1,6 +1,6 @@
 /*
  * jPOS Project [http://jpos.org]
- * Copyright (C) 2000-2013 Alejandro P. Revilla
+ * Copyright (C) 2000-2020 jPOS Software SRL
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU Affero General Public License as
@@ -18,25 +18,26 @@
 
 package org.jpos.ee;
 
-import java.util.List;
-import java.util.Iterator;
-import org.hibernate.Query;
+import java.util.*;
+
+import org.hibernate.query.NativeQuery;
+import org.hibernate.query.Query;
 import org.hibernate.Transaction;
 import org.hibernate.HibernateException;
-import org.hibernate.ObjectNotFoundException;
+import org.hibernate.resource.transaction.spi.TransactionStatus;
+import org.hibernate.type.IntegerType;
+
+import javax.persistence.criteria.*;
 
 @SuppressWarnings("unused")
-public class SysConfigManager {
-    DB db;
-    String prefix = "";
+public class SysConfigManager extends DBManager<SysConfig> {
+    private String prefix = "";
 
     public SysConfigManager (DB db) {
-        super();
-        this.db = db;
+        super(db,SysConfig.class);
     }
     public SysConfigManager (DB db, String prefix) {
-        super();
-        this.db = db;
+        super(db,SysConfig.class);
         this.prefix = prefix;
     }
     public void setPrefix (String prefix) {
@@ -49,11 +50,7 @@ public class SysConfigManager {
     	try {
             if (prefix != null)
                 name = prefix + name;
-            SysConfig cfg = (SysConfig) 
-                db.session().get (SysConfig.class, name);
-            return cfg != null;
-        } catch (ObjectNotFoundException e) {
-            // okay to happen
+            return db.session().get(SysConfig.class, name) != null;
         } catch (HibernateException e) {
             db.getLog().warn (e);
         }
@@ -69,7 +66,7 @@ public class SysConfigManager {
         try {
             if (prefix != null)
                 name = prefix + name;
-            SysConfig cfg = (SysConfig) db.session().get (SysConfig.class, name);
+            SysConfig cfg = db.session().get (SysConfig.class, name);
             if (cfg != null)
                 return cfg.getValue();
         } catch (HibernateException e) {
@@ -77,6 +74,34 @@ public class SysConfigManager {
         }
         return defaultValue;
     }
+
+    public SysConfig getObject(String name) {
+        try {
+            if (prefix != null)
+                name = prefix + name;
+            SysConfig cfg = db.session().get (SysConfig.class, name);
+            return cfg;
+        } catch (HibernateException e) {
+            db.getLog().warn (e);
+        }
+        return null;
+    }
+
+    public boolean delete (String name) {
+        try {
+            if (prefix != null)
+                name = prefix + name;
+            SysConfig cfg = db.session().get (SysConfig.class, name);
+            if (cfg != null) {
+                db.session().delete(cfg);
+                return true;
+            }
+        } catch (HibernateException e) {
+            db.getLog().warn (e);
+        }
+        return false;
+    }
+
     public SysConfig[] getAll  (String queryString) {
         SysConfig[] values;
         try {
@@ -98,29 +123,24 @@ public class SysConfigManager {
         }
         return values;
     }
-    public SysConfig[] getAll () {
-        SysConfig[] values;
-        try {
-            String queryAsString = "from sysconfig in class org.jpos.ee.SysConfig";
-            if (prefix != null)
-                queryAsString += " where id like :query";
-            Query query = db.session().createQuery (queryAsString + " order by id");
-            if (prefix != null)
-                query.setParameter ("query", prefix + "%");
-            List l = query.list();
-            values = new SysConfig[l.size()];
-            Iterator iter = l.iterator();
-            for (int i=0; iter.hasNext(); i++) {
-                values[i] = (SysConfig) iter.next();
-            }
-        } catch (HibernateException e) {
-            db.getLog().warn (e);
-            values = new SysConfig[0];
-        }
-        return values;
+    public List<SysConfig> getAll () {
+        HashMap<String,Boolean> orders = new HashMap<>();
+        orders.put("id",true);
+        return getAll(0,-1,orders);
+    }
+    public List<SysConfig> getAllByValue () {
+        HashMap<String,Boolean> orders = new HashMap<>();
+        orders.put("value",true);
+        return getAll(0,-1,orders);
     }
 
-
+    @Override
+    protected Predicate[] buildFilters(Root<SysConfig> root) {
+        Predicate[] predicates = new Predicate[] {
+            db.session().getCriteriaBuilder().like(root.get("id"),prefix + "%")
+        };
+        return predicates;
+    }
 
     @SuppressWarnings("unchecked")
     public Iterator<SysConfig> iterator() {
@@ -144,14 +164,15 @@ public class SysConfigManager {
         SysConfig cfg;
         if (prefix != null)
             name = prefix + name;
+
         try {
             boolean autoCommit = false;
             Transaction tx = db.session().getTransaction();
-            if (tx == null || !tx.isActive()) {
+            if (tx == null || tx.getStatus().isNotOneOf(TransactionStatus.ACTIVE)) {
                 tx = db.session().beginTransaction();
                 autoCommit = true;
             }
-            cfg = (SysConfig) db.session().get (SysConfig.class, name);
+            cfg = db.session().get (SysConfig.class, name);
             boolean saveIt = false;
             if (cfg == null) {
                 cfg = new SysConfig ();
@@ -202,5 +223,13 @@ public class SysConfigManager {
         return v.length() == 0 ? def :
             (v.equalsIgnoreCase("true") || v.equalsIgnoreCase("yes"));
     }
+    public int getMaxIdLength() {
+        String queryString = "select max(length(id)) as maxidlen from sysconfig";
+        if (prefix != null)
+            queryString += " where id like :query";
+        NativeQuery query =  db.session().createNativeQuery(queryString);
+        if (prefix != null)
+            query.setParameter ("query", prefix + "%");
+        return (int) query.addScalar("maxidlen",  IntegerType.INSTANCE).getSingleResult();
+    }
 }
-

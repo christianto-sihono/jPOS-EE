@@ -1,6 +1,6 @@
 /*
  * jPOS Project [http://jpos.org]
- * Copyright (C) 2000-2013 Alejandro P. Revilla
+ * Copyright (C) 2000-2020 jPOS Software SRL
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU Affero General Public License as
@@ -51,13 +51,13 @@ public class Heartbeat extends QBeanSupport implements Runnable {
                 if (cfg.getBoolean ("check", true))
                     mgr.check ();
                 mgr.touch (statusId, Status.OK, getDetail (start, i));
-                Thread.sleep (interval);
             } catch (Throwable t) {
                 getLog().error (t);
                 ISOUtil.sleep (1000);
             } finally {
                 close();
             }
+            ISOUtil.sleep (interval);
         }
     }
     private void close() {
@@ -67,7 +67,7 @@ public class Heartbeat extends QBeanSupport implements Runnable {
             getLog().error (e);
         }
     }
-    private String getDetail (long start, int tick) {
+    protected String getDetail (long start, int tick) {
         Runtime r = Runtime.getRuntime();
         StringBuffer sb = new StringBuffer();
         sb.append ("memory=");

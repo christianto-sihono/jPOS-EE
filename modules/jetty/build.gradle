@@ -1,6 +1,8 @@
 description = 'jPOS-EE :: Jetty Web Module'
 
 dependencies {
-    compile project(':modules:core')
-    compile jettyLibs
+    api project(':modules:core')
+    api jettyLibs
+    api "javax.websocket:javax.websocket-api:${websocketApiVersion}"
 }
+

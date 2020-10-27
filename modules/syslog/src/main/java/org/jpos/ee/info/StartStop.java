@@ -1,6 +1,6 @@
 /*
  * jPOS Project [http://jpos.org]
- * Copyright (C) 2000-2013 Alejandro P. Revilla
+ * Copyright (C) 2000-2020 jPOS Software SRL
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU Affero General Public License as
@@ -24,12 +24,19 @@ import org.jpos.q2.QBeanSupport;
 import org.jpos.util.DateUtil;
 
 @SuppressWarnings("unused")
-public class StartStop extends QBeanSupport {
+public class StartStop extends QBeanSupport implements Runnable {
     long start;
     public void startService() {
         start = System.currentTimeMillis();
-        new SysLogManager().log (cfg.get ("source", getName()),
-            "SYSTEM", SysLog.INFO, "Start");
+        new Thread(this, getName()).start();
+    }
+    public void run () {
+        if (getServer().ready(60000L)) {
+            new SysLogManager().log (cfg.get ("source", getName()),
+              "SYSTEM", SysLog.INFO, "Start");
+        } else {
+            getLog().warn ("Q2 not ready");
+        }
     }
     public void stopService() {
         long elapsed = System.currentTimeMillis() - start;

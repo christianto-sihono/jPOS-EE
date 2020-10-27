@@ -1,6 +1,6 @@
 /*
  * jPOS Project [http://jpos.org]
- * Copyright (C) 2000-2013 Alejandro P. Revilla
+ * Copyright (C) 2000-2020 jPOS Software SRL
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU Affero General Public License as
@@ -14,9 +14,7 @@
  *
  * You should have received a copy of the GNU Affero General Public License
  * along with this program.  If not, see <http://www.gnu.org/licenses/>.
- *
  */
-
 
 package org.jpos.q2;
 
@@ -33,6 +31,7 @@ public abstract class QuartzJobSupport implements Job, Configurable, Runnable {
     Configuration cfg;
     JobExecutionContext executionContext;
     Log log;
+    QuartzAdaptor.Q2Adaptor adaptor;
 
     public QuartzJobSupport() {
         super();
@@ -65,7 +64,7 @@ public abstract class QuartzJobSupport implements Job, Configurable, Runnable {
         Object o = ctx.getJobDetail().getJobDataMap().get("Q2");
         try {
             if (o instanceof QuartzAdaptor.Q2Adaptor) {
-                QuartzAdaptor.Q2Adaptor adaptor = (QuartzAdaptor.Q2Adaptor) o;
+                adaptor = (QuartzAdaptor.Q2Adaptor) o;
                 log = new Log(adaptor.getLogger(), adaptor.getRealm());
                 setConfiguration(adaptor.getConfiguration());
             }
@@ -73,5 +72,8 @@ public abstract class QuartzJobSupport implements Job, Configurable, Runnable {
         } catch (Exception e) {
             getLog().warn(e);
         }
+    }
+    public boolean running() {
+        return adaptor == null || adaptor.running();
     }
 }

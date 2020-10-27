@@ -1,6 +1,6 @@
 /*
  * jPOS Project [http://jpos.org]
- * Copyright (C) 2000-2013 Alejandro P. Revilla
+ * Copyright (C) 2000-2020 jPOS Software SRL
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU Affero General Public License as
@@ -21,45 +21,43 @@ package org.jpos.simulator;
 import java.io.File;
 import java.io.IOException;
 import java.io.FileInputStream;
-import java.util.Map;
-import java.util.Date;
-import java.util.HashMap;
-import java.util.Iterator;
-import java.util.List;
-import java.util.ArrayList;
-import org.jpos.iso.ISOMsg;
-import org.jpos.iso.ISOComponent;
-import org.jpos.iso.ISOUtil;
-import org.jpos.iso.ISODate;
-import org.jpos.iso.ISOField;
-import org.jpos.iso.ISOHeader;
-import org.jpos.iso.ISOPackager;
-import org.jpos.iso.ISOException;
+import java.util.*;
+
+import org.jpos.iso.*;
 import org.jpos.iso.packager.XMLPackager;
-import org.jpos.q2.QBeanSupport;
 import org.jpos.util.Logger;
 import org.jpos.util.LogEvent;
-import org.jdom.Element;
-import org.jpos.iso.MUX;
+import org.jdom2.Element;
 import org.jpos.util.NameRegistrar;
 import bsh.Interpreter;
 import bsh.BshClassManager;
 import bsh.EvalError;
 import bsh.UtilEvalError;
+import org.xml.sax.SAXException;
 
 public class TestRunner
-    extends org.jpos.q2.QBeanSupport 
-    implements Runnable 
+    extends org.jpos.q2.QBeanSupport
+    implements Runnable
 {
     MUX mux;
     ISOPackager packager;
     Interpreter bsh;
+    private static final String NL = System.getProperty("line.separator");
     public static final long TIMEOUT = 60000;
     public TestRunner () {
         super();
     }
     protected void initService() throws ISOException {
-        packager = new XMLPackager();
+        String packagerClass = cfg.get("packager", null);
+        if (packagerClass != null) {
+            try {
+                packager = (ISOPackager) Class.forName(packagerClass).newInstance();
+            } catch (InstantiationException | IllegalAccessException | ClassNotFoundException e) {
+                throw new ISOException("Error instatiating packager", e);
+            }
+        } else {
+            packager = getDefaultPackager();
+        }
     }
     protected void startService() {
         for (int i=0; i<cfg.getInt("sessions", 1); i++)
@@ -80,10 +78,10 @@ public class TestRunner
             getLog().error (t);
         }
         if (cfg.getBoolean ("shutdown"))
-            shutdownQ2();
+            getServer().shutdown();
     }
-    private void runSuite (List suite, MUX mux, Interpreter bsh) 
-        throws ISOException, EvalError
+    private void runSuite (List suite, MUX mux, Interpreter bsh)
+        throws ISOException, IOException, EvalError
     {
         LogEvent evt = getLog().createLogEvent ("results");
         LogEvent evt_error = null;
@@ -93,30 +91,40 @@ public class TestRunner
         for (int i=1; iter.hasNext(); i++) {
             evt_error = getLog().createLogEvent("error");
             TestCase tc = (TestCase) iter.next();
+            for (long repetition = 0; repetition < tc.getCount(); repetition++) {
+                getLog().trace (
+                    "---------------------------[ "
+                  + tc.getName()
+                  + " ]---------------------------" );
 
-            getLog().trace (
-                "---------------------------[ " 
-              + tc.getName() 
-              + " ]---------------------------" );
-
-            ISOMsg m = (ISOMsg) tc.getRequest().clone();
-            if (tc.getPreEvaluationScript() != null) {
-                bsh.set ("testcase", tc);
-                bsh.set ("request", m);
-                bsh.eval (tc.getPreEvaluationScript());
+                ISOMsg m = (ISOMsg) tc.getRequest().clone();
+                if (tc.getPreEvaluationScript() != null) {
+                    bsh.set ("testcase", tc);
+                    bsh.set ("request", m);
+                    bsh.eval (tc.getPreEvaluationScript());
+                }
+                tc.setExpandedRequest (applyRequestProps (m, bsh));
+                tc.start();
+                if (tc.getExpectedResponse() != null) {
+                    tc.setResponse(mux.request(m, tc.getTimeout()));
+                    tc.end();
+                    assertResponse(tc, bsh, evt_error);
+                    evt.addMessage(i + ": " + tc.toString());
+                    if (evt_error.getPayLoad().size() != 0) {
+                        evt_error.addMessage("filename", tc.getFilename());
+                        evt.addMessage(NL + evt_error.toString("    "));
+                    }
+                    serverTime += tc.elapsed();
+                    if (!tc.ok() && !tc.isContinueOnErrors())
+                        break;
+                } else {
+                    // response not expected - fire and forget
+                    mux.send(m);
+                    tc.end();
+                    tc.setResultCode(TestCase.OK);
+                    evt.addMessage(i + ": " + tc.toString() + " (response ignored)");
+                }
             }
-            tc.setExpandedRequest (applyRequestProps (m, bsh));
-            tc.start();
-	    tc.setResponse (mux.request (m, tc.getTimeout()));
-            tc.end ();
-            assertResponse(tc, bsh, evt_error);
-            evt.addMessage (i + ": " + tc.toString());
-            if (evt_error.getPayLoad().size()!=0) {
-                evt_error.addMessage("filename", tc.getFilename());
-            evt.addMessage("\r\n" + evt_error);
-            }
-
-            serverTime += tc.elapsed();
             if (!tc.ok()) {
                 getLog().error (tc);
                 if (!tc.isContinueOnErrors())
@@ -129,9 +137,9 @@ public class TestRunner
         long total = end - start;
 
         evt.addMessage (
-            "elapsed server=" + serverTime 
+            "elapsed server=" + serverTime
             + "ms(" + percentage (serverTime, total) + "%)"
-            + ", simulator=" + simulatorTime 
+            + ", simulator=" + simulatorTime
             + "ms(" + percentage (simulatorTime, total) + "%)"
             + ", total=" + total + "ms, shutdown="
             + cfg.getBoolean("shutdown")
@@ -142,10 +150,10 @@ public class TestRunner
 
         Logger.log (evt);
     }
-    private List initSuite (Element suite) 
+    private List<TestCase> initSuite (Element suite)
         throws IOException, ISOException
     {
-        List l = new ArrayList();
+        List<TestCase> l = new ArrayList<>();
         String prefix = suite.getChildTextTrim ("path");
         Iterator iter = suite.getChildren ("test").iterator();
         while (iter.hasNext ()) {
@@ -158,42 +166,46 @@ public class TestRunner
             if (name == null)
                 name = path;
 
-            for (int i=0; i<count; i++) {
-                TestCase tc = new TestCase (name);
-                tc.setContinueOnErrors (cont);
-                tc.setRequest (getMessage (prefix + path + "_s"));
-                tc.setExpectedResponse (getMessage (prefix + path + "_r"));
-                tc.setPreEvaluationScript (e.getChildTextTrim ("init"));
-                tc.setPostEvaluationScript (e.getChildTextTrim ("post"));
-                tc.setFilename(prefix + path);
+            TestCase tc = new TestCase (name);
+            tc.setCount(count);
+            tc.setContinueOnErrors (cont);
+            tc.setRequest (getMessage (prefix + path + "_s"));
+            tc.setExpectedResponse (getMessage (prefix + path + "_r"));
+            tc.setPreEvaluationScript (e.getChildTextTrim ("init"));
+            tc.setPostEvaluationScript (e.getChildTextTrim ("post"));
+            tc.setFilename(prefix + path);
 
-                String to  = e.getAttributeValue ("timeout");
-                if (to != null)
-                    tc.setTimeout (Long.parseLong (to));
-                else
-                    tc.setTimeout (cfg.getLong ("timeout", TIMEOUT));
-                l.add (tc);
-            }
+            String to  = e.getAttributeValue ("timeout");
+            if (to != null)
+                tc.setTimeout (Long.parseLong (to));
+            else
+                tc.setTimeout (cfg.getLong ("timeout", TIMEOUT));
+            l.add (tc);
+
         }
         return l;
     }
-    private ISOMsg getMessage (String filename) 
-        throws IOException, ISOException 
+    private ISOMsg getMessage (String filename)
+        throws IOException, ISOException
     {
         File f = new File (filename);
-	FileInputStream fis = new FileInputStream (f);
-	try {
-	    byte[] b  = new byte[fis.available()];
-	    fis.read (b);
-	    ISOMsg m = new ISOMsg ();
-	    m.setPackager (packager);
-	    m.unpack (b);
-            return m;
-    	} finally {
-	    fis.close();
-	}
+        ISOMsg m = null;
+        if (f.canRead()) {
+            try (FileInputStream fis = new FileInputStream (f)) {
+                byte[] b  = new byte[fis.available()];
+                fis.read (b);
+                m = new ISOMsg ();
+                m.setPackager (packager);
+                try {
+                    m.unpack(b);
+                } catch (ISOException e) {
+                    throw new ISOException ("Error parsing '" + filename + "'", e);
+                }
+            }
+        }
+        return m;
     }
-    private boolean processResponse 
+    private boolean processResponse
         (ISOMsg er, ISOMsg m, ISOMsg expected, Interpreter bsh, LogEvent evt)
         throws ISOException, EvalError
     {
@@ -204,7 +216,7 @@ public class TestRunner
                 ISOComponent c = expected.getComponent (i);
                 if (c instanceof ISOField) {
                     String value = expected.getString (i);
-                    if (value.charAt (0) == '!' && value.length() > 1) 
+                    if (value.charAt (0) == '!' && value.length() > 1)
                     {
                         bsh.set  ("value", m.getString (i));
                         Object ret = bsh.eval (value.substring (1));
@@ -239,6 +251,17 @@ public class TestRunner
                             //return false;
                         }
                     }
+                    else if (value.startsWith("*A")) {
+                        if (m.hasField(i)) {
+                        // To make sure value is not returned for this field
+                        evt.addMessage("field", "[" + i + "] Received:[" + m.getString(i) + "]"
+                                + " Expected: Not to be set");
+                        }
+                        else {
+                            m.unset(i);
+                            expected.unset(i);
+                        }
+                    }
                     else if (m.hasField(i) && !m.getString(i).equals(value)) {
                         evt.addMessage("field", "[" + i+ "] Received:[" + m.getString(i) + "]" + " Expected:[" + value + "]");
                        // return false;
@@ -270,12 +293,12 @@ public class TestRunner
         ISOMsg c = (ISOMsg) tc.getResponse().clone();
         ISOMsg expected = (ISOMsg) tc.getExpectedResponse().clone();
         ISOMsg er = (ISOMsg) tc.getExpandedRequest().clone();
-        c.setHeader ((ISOHeader) null);
+        c.setHeader(tc.getResponse().getHeader());
         if (!processResponse(er, c, expected, bsh, evt)) {
             tc.setResultCode (TestCase.FAILURE);
             return false;
         }
-        ISOPackager p = new XMLPackager();
+        ISOPackager p = getDefaultPackager();
         expected.setPackager(p);
         c.setPackager(p);
 
@@ -283,21 +306,26 @@ public class TestRunner
             bsh.set ("testcase", tc);
             bsh.set ("response", tc.getResponse());
             Object ret = bsh.eval (tc.getPostEvaluationScript());
-            if (ret instanceof Boolean) {
-                if (!((Boolean)ret).booleanValue()){
-                    tc.setResultCode (TestCase.FAILURE);
-                    return false;
-                }
+            if (ret instanceof Boolean && !(Boolean)ret) {
+                tc.setResultCode (TestCase.FAILURE);
+                return false;
             }
         }
-        if (!(new String(c.pack())).equals(new String(expected.pack()))) {
+        if (expected.getHeader() == null)
+            c.setHeader((byte[]) null);
+        if (!Arrays.equals(c.pack(), expected.pack())) {
+            evt.addMessage("Pack mismatch");
+            evt.addMessage("--- expected ---");
+            evt.addMessage(ISOUtil.hexdump (expected.pack()));
+            evt.addMessage("--- actual ---");
+            evt.addMessage(ISOUtil.hexdump (c.pack()));
             tc.setResultCode (TestCase.FAILURE);
             return false;
         }
         tc.setResultCode (TestCase.OK);
         return true;
     }
-    private void eval (Element e, String name, Interpreter bsh) 
+    private void eval (Element e, String name, Interpreter bsh)
         throws EvalError
     {
         Element ee = e.getChild (name);
@@ -314,7 +342,7 @@ public class TestRunner
         bsh.eval (getPersist().getChildTextTrim ("init"));
         return bsh;
     }
-    private ISOMsg applyRequestProps (ISOMsg m, Interpreter bsh) 
+    private ISOMsg applyRequestProps (ISOMsg m, Interpreter bsh)
         throws ISOException, EvalError
     {
         int maxField = m.getMaxField();
@@ -329,7 +357,7 @@ public class TestRunner
                         try {
                             if (value.charAt (0) == '!') {
                                 m.set (i, bsh.eval (value.substring(1)).toString());
-                            } 
+                            }
                             else if (value.charAt (0) == '#') {
                                 m.set (i, ISOUtil.hex2byte(bsh.eval (value.substring(1)).toString()));
                             }
@@ -346,5 +374,19 @@ public class TestRunner
         double d = (double) a / b;
         return (long) (d * 100.00);
     }
+
+
+    private ISOPackager getDefaultPackager() throws ISOException {
+        XMLPackager p= new XMLPackager();
+        try {
+            p.setXMLParserFeature("http://apache.org/xml/features/disallow-doctype-decl", false);
+            p.setXMLParserFeature("http://xml.org/sax/features/external-general-entities", true);
+            p.setXMLParserFeature("http://xml.org/sax/features/external-parameter-entities", true);
+            return p;
+        } catch (SAXException e) {
+            throw new ISOException("Error creating XMLPackager", e);
+        }
+    }
+
 }
 

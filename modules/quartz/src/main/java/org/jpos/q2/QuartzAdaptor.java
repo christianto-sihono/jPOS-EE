@@ -1,6 +1,6 @@
 /*
  * jPOS Project [http://jpos.org]
- * Copyright (C) 2000-2013 Alejandro P. Revilla
+ * Copyright (C) 2000-2020 jPOS Software SRL
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU Affero General Public License as
@@ -14,13 +14,11 @@
  *
  * You should have received a copy of the GNU Affero General Public License
  * along with this program.  If not, see <http://www.gnu.org/licenses/>.
- *
  */
-
 
 package org.jpos.q2;
 
-import org.jdom.Element;
+import org.jdom2.Element;
 import org.jpos.core.Configurable;
 import org.jpos.core.Configuration;
 import org.jpos.core.ConfigurationException;
@@ -28,22 +26,23 @@ import org.jpos.core.XmlConfigurable;
 import org.jpos.util.LogEvent;
 import org.jpos.util.LogSource;
 import org.jpos.util.Logger;
+import org.jpos.util.NameRegistrar;
 import org.quartz.*;
 import org.quartz.impl.StdSchedulerFactory;
 
 import java.util.Date;
-import java.util.List;
+import java.util.Properties;
 import java.util.UUID;
 
 @SuppressWarnings("unused unchecked")
 public class QuartzAdaptor extends QBeanSupport implements XmlConfigurable {
-    Scheduler scheduler;
-    Element config;
+    private Scheduler scheduler;
+    private Element config;
     protected void initService() throws Exception {
-        scheduler = StdSchedulerFactory.getDefaultScheduler();
+        scheduler = createScheduler();
         QFactory factory = getFactory();
         LogEvent evt = getLog().createInfo();
-        for (Element e : (List<Element>) config.getChildren("job")) {
+        for (Element e : config.getChildren("job")) {
             String jobId = e.getAttributeValue("id");
             if (jobId == null)
                 jobId = UUID.randomUUID().toString();
@@ -80,12 +79,16 @@ public class QuartzAdaptor extends QBeanSupport implements XmlConfigurable {
                 evt.addMessage(e1);
             }
         }
+
+        NameRegistrar.register(getName(), this);
+
         Logger.log(evt);
     }
     protected void startService() throws SchedulerException {
         scheduler.start();
     }
     protected void stopService() throws SchedulerException {
+        NameRegistrar.unregister(getName());
         scheduler.shutdown(true);
     }
     protected void destroyService() {
@@ -121,5 +124,32 @@ public class QuartzAdaptor extends QBeanSupport implements XmlConfigurable {
         public Logger getLogger() {
             return logger;
         }
+
+        public boolean running() {
+            return QuartzAdaptor.this.running();
+        }
+    }
+
+    private Scheduler createScheduler() throws SchedulerException {
+        Properties p = new Properties();
+
+        p.setProperty("org.quartz.scheduler.instanceName", getName());
+        p.setProperty("org.quartz.threadPool.threadsInheritContextClassLoaderOfInitializingThread", "true");
+        p.setProperty("org.quartz.scheduler.rmi.proxy", "false");
+        p.setProperty("org.quartz.scheduler.rmi.export", "false");
+        p.setProperty("org.quartz.jobStore.misfireThreshold", "60000");
+        p.setProperty("org.quartz.threadPool.threadCount", "10");
+        p.setProperty("org.quartz.scheduler.wrapJobExecutionInUserTransaction", "false");
+        p.setProperty("org.quartz.threadPool.class", "org.quartz.simpl.SimpleThreadPool");
+        p.setProperty("org.quartz.jobStore.class", "org.quartz.simpl.RAMJobStore");
+        p.setProperty("org.quartz.threadPool.threadPriority", "5");
+
+        // add ability to override defaults
+        cfg.keySet()
+          .stream()
+          .filter (s -> s.startsWith("org.quartz."))
+          .forEach(s -> p.put(s, cfg.get(s)));
+
+        return new StdSchedulerFactory(p).getScheduler();
     }
 }

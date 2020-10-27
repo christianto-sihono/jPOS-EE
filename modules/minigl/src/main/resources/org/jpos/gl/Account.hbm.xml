@@ -28,33 +28,31 @@
     </id>
 
     <discriminator column="subclass" type="string" length="1" />
-
-    <property name="code">
-     <column name="code" sql-type="varchar(255)" 
-        not-null="true" index="acctCode" />
+    <property name="code" unique-key="AccountRootCode">
+      <column name="code" sql-type="varchar(255)" not-null="true" />
     </property>
+    <many-to-one name="root"  not-null="false" foreign-key="FKAccountChart" lazy="false" unique-key="AccountRootCode" />
+
     <property name="description" />
+    <property name="tags"  type="org.jpos.ee.usertype.TagsType">
+      <column name="tags" sql-type="varchar(255)" not-null="false" />
+    </property>
     <property name="created"    type="date" />
     <property name="expiration" type="date" />
     <property name="type">
      <column name="type" sql-type="smallint" />
     </property>
     <property name="currencyCode">
-     <column name="currency" sql-type="char(3)" />
+     <column name="currency" sql-type="char(5)" />
     </property>
-    <many-to-one name="root"  not-null="false" foreign-key="FKAccountChart" />
+    <many-to-one name="parent" not-null="false" cascade="evict" foreign-key="FKAccountParent" lazy="false"/>
     <subclass name="org.jpos.gl.CompositeAccount" discriminator-value="C">
-      <set name="children" cascade="all-delete-orphan,evict" sort="natural" lazy="true" inverse="true">
+      <set name="children" cascade="all-delete-orphan,evict" sort="natural" lazy="true" inverse="true" batch-size="0">
         <key column="parent" />
         <!-- index column="posn" / -->
         <one-to-many class="org.jpos.gl.Account" />
       </set>
-      <many-to-one name="parent" not-null="false" cascade="evict" foreign-key="FKAccountParent" />
     </subclass>
-
-    <subclass name="org.jpos.gl.FinalAccount" discriminator-value="F">
-      <many-to-one name="parent" not-null="false" cascade="evict" foreign-key="FKAccountParent"/>
-    </subclass>
+    <subclass name="org.jpos.gl.FinalAccount" discriminator-value="F" />
   </class>
 </hibernate-mapping>
-

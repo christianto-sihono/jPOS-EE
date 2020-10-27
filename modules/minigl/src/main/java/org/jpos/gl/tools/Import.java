@@ -1,6 +1,6 @@
 /*
  * jPOS Project [http://jpos.org]
- * Copyright (C) 2000-2013 Alejandro P. Revilla
+ * Copyright (C) 2000-2020 jPOS Software SRL
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU Affero General Public License as
@@ -20,19 +20,17 @@ package org.jpos.gl.tools;
 
 import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
+import org.dom4j.DocumentException;
 import org.hibernate.HibernateException;
 import org.hibernate.Query;
 import org.hibernate.Session;
-import org.hibernate.SessionFactory;
 import org.hibernate.Transaction;
-import org.hibernate.cfg.Configuration;
-import org.hibernate.tool.hbm2ddl.SchemaExport;
-import org.jdom.Document;
-import org.jdom.Element;
-import org.jdom.JDOMException;
-import org.jdom.input.SAXBuilder;
+import org.jdom2.Document;
+import org.jdom2.Element;
+import org.jdom2.JDOMException;
+import org.jdom2.input.SAXBuilder;
 import org.jpos.core.ConfigurationException;
-import org.jpos.ee.support.JPosHibernateConfiguration;
+import org.jpos.ee.DB;
 import org.jpos.gl.*;
 import org.xml.sax.EntityResolver;
 import org.xml.sax.InputSource;
@@ -53,16 +51,33 @@ import java.util.Set;
  * @author <a href="mailto:apr@jpos.org">Alejandro Revilla</a>
  */
 public class Import implements EntityResolver {
-    SessionFactory sf;
-    Configuration cfg;
     Log log = LogFactory.getLog (Import.class);
     private static final String URL = "http://jpos.org/";
+    private String configModifier;
+    /**
+     * This setting controls whether to check that child account codes
+     * contain the parent account code as a prefix. Defaults to true
+     * for optimal compatibility with getBalances native queries,
+     * but may be set to false to import a legacy system that doesn't
+     * use native queries.
+     */
+    private boolean strictAccountCodes = true;
+
+    public Import (String configModifier) throws HibernateException, GLException, IOException, ConfigurationException
+    {
+        super();
+        this.configModifier = configModifier;
+    }
     public Import () throws HibernateException, GLException, IOException, ConfigurationException
     {
         super();
-        cfg = new JPosHibernateConfiguration();
-        cfg.configure();
-        sf = cfg.buildSessionFactory();
+        this.configModifier = null;
+    }
+    /**
+     * @param setting - new value for `strictAccountCodes`
+     */
+    public void setStrictAccountCodes(Boolean setting) {
+        strictAccountCodes = setting;
     }
 
     public static void usage () {
@@ -70,15 +85,17 @@ public class Import implements EntityResolver {
         System.exit (0);
     }
 
-    private void createSchema () throws HibernateException {
-        SchemaExport export = new SchemaExport (cfg);
-        // export.setOutputFile ("/tmp/schema.sql");
-        // export.setDelimiter (";");
-        export.create (true, true); // don't create tables
+    private void createSchema () throws HibernateException, DocumentException {
+        DB db = new DB(configModifier);
+        db.open();
+        db.beginTransaction();
+        db.createSchema(null, true);
+        db.commit();
+        db.close();
     }
     
     private void createCharts (Session sess, Iterator iter) 
-        throws SQLException, HibernateException, ParseException
+        throws SQLException, HibernateException, ParseException, GLException
     {
         Transaction txn = sess.beginTransaction();
         while (iter.hasNext()) {
@@ -92,7 +109,6 @@ public class Import implements EntityResolver {
             sess.flush ();
         }
         txn.commit();
-        sess.flush ();
     }
     private void createCurrencies (Session sess, Iterator iter) 
         throws SQLException, HibernateException, ParseException
@@ -104,7 +120,6 @@ public class Import implements EntityResolver {
             sess.save (currency);
         }
         txn.commit();
-        sess.flush ();
     }
     private void createUsers (Session sess, Iterator iter) 
         throws SQLException, HibernateException, ParseException
@@ -124,7 +139,6 @@ public class Import implements EntityResolver {
             sess.save (user);
         }
         txn.commit();
-        sess.flush ();
     }
     private void createJournals (Session sess, Iterator iter) 
         throws SQLException, HibernateException, ParseException
@@ -136,12 +150,12 @@ public class Import implements EntityResolver {
             journal.setChart (
                 getChart (sess, elem.getChildTextTrim ("chart"))
             );
+            sess.save (journal);
             journal.setPermissions (
                 createPermissions (
-                    sess, elem.getChildren ("grant").iterator()
+                    sess, journal, elem.getChildren ("grant").iterator()
                 )
             );
-            sess.save (journal);
             createJournalLayers (
                 sess, journal, elem.getChildren ("layer").iterator()
             );
@@ -150,11 +164,10 @@ public class Import implements EntityResolver {
             );
         }
         txn.commit();
-        sess.flush ();
     }
     private void processChartChildren 
         (Session sess, CompositeAccount parent, Iterator iter) 
-            throws SQLException, HibernateException, ParseException
+            throws SQLException, HibernateException, ParseException, GLException
     {
         while (iter.hasNext ()) {
             Element e = (Element) iter.next ();
@@ -166,10 +179,20 @@ public class Import implements EntityResolver {
         }
     }
 
+    private void validateAccountCode(Account parent, Account child)
+            throws GLException
+    {
+        if (!parent.isChart() && !child.getCode().startsWith(parent.getCode())) {
+            throw new GLException("Child account code `"+child.getCode()+"` must start with parent account code `"+parent.getCode()+"`");
+        }
+    }
     private void createComposite (Session sess, CompositeAccount parent, Element elem) 
-        throws SQLException, HibernateException, ParseException
+        throws SQLException, HibernateException, ParseException, GLException
     {
         CompositeAccount acct = new CompositeAccount (elem, parent);
+        if (strictAccountCodes)
+            validateAccountCode(parent, acct);
+
         acct.setRoot (parent.getRoot ());
         sess.save (acct);
         acct.setParent (parent);
@@ -179,50 +202,53 @@ public class Import implements EntityResolver {
     }
 
     private void createFinal (Session sess, CompositeAccount parent, Element elem) 
-        throws SQLException, HibernateException, ParseException
+        throws SQLException, HibernateException, ParseException, GLException
     {
         FinalAccount acct = new FinalAccount (elem, parent);
+        if (strictAccountCodes)
+            validateAccountCode(parent, acct);
+
         acct.setRoot (parent.getRoot ());
         sess.save (acct);
         acct.setParent (parent);
         parent.getChildren().add (acct);
     }
 
-    private void createTransactions (Session sess, Iterator iter) 
-        throws SQLException, HibernateException, ParseException
-    {
+    private void createTransactions (DB db, Iterator iter)
+      throws SQLException, HibernateException, ParseException, GLException {
+        GLSession gls = new GLSession(db);
         while (iter.hasNext()) {
-            Transaction txn = sess.beginTransaction();
+            Transaction txn = db.beginTransaction();
             Element elem = (Element) iter.next ();
             GLTransaction glt = new GLTransaction (elem);
             Journal journal = getJournal (
-                sess, elem.getAttributeValue ("journal")
+                db.session(), elem.getAttributeValue ("journal")
             );
             glt.setJournal (journal);
-            sess.save (glt);
-            createEntries (
-                sess, glt, 
+            addEntries (
+                db.session(), glt,
                 elem.getChildren("entry").iterator()
             );
+            gls.post(journal, glt);
             txn.commit ();
+            System.out.println (glt.getId() + " " + glt.getDetail());
         }
-        sess.flush ();
     }
-    private void createEntries (
-        Session sess, GLTransaction glt, Iterator iter) 
+    private void addEntries (
+        Session sess, GLTransaction glt, Iterator iter)
         throws SQLException, HibernateException, ParseException
     {
         Account chart = glt.getJournal().getChart ();
         while (iter.hasNext()) {
             Element elem = (Element) iter.next ();
-            GLEntry entry = 
+            GLEntry entry =
                 "credit".equals (elem.getAttributeValue ("type")) ?
-                ((GLEntry) new GLCredit ()) :
-                ((GLEntry) new GLDebit ());
+                (new GLCredit ()) :
+                (new GLDebit ());
+
             entry.fromXML (elem);
             entry.setAccount (getFinalAccount (sess, chart, elem));
             entry.setTransaction (glt);
-            sess.save (entry);
             glt.getEntries().add (entry);
         }
     }
@@ -295,7 +321,7 @@ public class Import implements EntityResolver {
         }
         return (GLUser) l.get(0);
     }
-    private Set createPermissions (Session session, Iterator iter) 
+    private Set createPermissions (Session session, Journal j, Iterator iter)
         throws HibernateException
     {
         Set permissions = new HashSet ();
@@ -304,8 +330,10 @@ public class Import implements EntityResolver {
             GLUser user = getUser (session, e.getAttributeValue ("user"));
             GLPermission p = new GLPermission (e.getTextTrim());
             p.setUser (user);
-            session.save (p);
+            p.setJournal (j);
             permissions.add (p);
+            user.getPermissions().add(p);
+            session.save (p);
         }
         return permissions;
     }
@@ -338,10 +366,9 @@ public class Import implements EntityResolver {
         else 
             return null;
     }
-    public void parse (String file) 
-        throws JDOMException, SQLException, HibernateException,
-               ParseException, IOException, GLException
-    {
+    public void parse (String file)
+      throws JDOMException, SQLException, HibernateException,
+      ParseException, IOException, GLException, DocumentException {
         SAXBuilder builder = new SAXBuilder (true);
         builder.setEntityResolver (this);
 
@@ -357,13 +384,14 @@ public class Import implements EntityResolver {
         if (root.getChild ("create-schema") != null)
             createSchema ();
 
-        Session sess = sf.openSession();
-        createUsers (sess, root.getChildren ("user").iterator());
-        createCurrencies (sess, root.getChildren ("currency").iterator());
-        createCharts (sess, root.getChildren ("chart-of-accounts").iterator());
-        createJournals (sess, root.getChildren ("journal").iterator());
-        createTransactions (sess, root.getChildren ("transaction").iterator());
-        sess.close ();
+        try (DB db = new DB(configModifier)) {
+            Session sess = db.open();
+            createUsers(sess, root.getChildren("user").iterator());
+            createCurrencies(sess, root.getChildren("currency").iterator());
+            createCharts(sess, root.getChildren("chart-of-accounts").iterator());
+            createJournals(sess, root.getChildren("journal").iterator());
+            createTransactions(db, root.getChildren("transaction").iterator());
+        }
     }
 
     public static void main (String[] args) {
@@ -373,7 +401,7 @@ public class Import implements EntityResolver {
         try {
             new Import().parse (args[0]);
         } catch (Exception e) {
-            e.printStackTrace();
+            System.out.println (e.getMessage());
         }
    }
 }

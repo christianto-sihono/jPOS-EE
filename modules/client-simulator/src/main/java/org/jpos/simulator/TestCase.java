@@ -1,6 +1,6 @@
 /*
  * jPOS Project [http://jpos.org]
- * Copyright (C) 2000-2013 Alejandro P. Revilla
+ * Copyright (C) 2000-2020 jPOS Software SRL
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU Affero General Public License as
@@ -41,6 +41,8 @@ public class TestCase implements Loggeable {
     int resultCode;
     boolean continueOnErrors;
     private String testcasePath;
+    private long count;
+
 
     public TestCase (String name) {
         super();
@@ -169,5 +171,12 @@ public class TestCase implements Loggeable {
     public String getFilename() {
         return testcasePath;
     }
+	public void setCount(long count) {
+		this.count = count;
+	}
+    public long getCount() {
+        return count;
+    }
+	
 }
 

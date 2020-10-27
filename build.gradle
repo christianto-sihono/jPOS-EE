@@ -1,25 +1,38 @@
 apply from: 'libraries.gradle'
 
+buildscript {
+    repositories {
+        mavenCentral()
+    }
+    dependencies {
+        classpath 'org.owasp:dependency-check-gradle:5.2.1'
+    }
+}
+
+
 allprojects {
     apply plugin: 'idea'
     apply plugin: 'eclipse'
     apply plugin: 'maven'
+    apply plugin: 'org.owasp.dependencycheck'
 
     group = 'org.jpos.ee'
-    version = '2.0.1-SNAPSHOT'
+    version = '2.2.7-SNAPSHOT'
 }
 
 subprojects {
-    apply plugin: 'java'
-    sourceCompatibility = 1.6
-    targetCompatibility = 1.6
+    apply plugin: 'java-library'
+    apply plugin: 'signing'
+    sourceCompatibility = 1.8
+    targetCompatibility = 1.8
     [ compileJava, compileTestJava, javadoc ]*.options*.encoding = 'UTF-8'
-
-    tasks.withType(Compile) {
-        options.warnings = false
-    }
+    def isSnapshot = version.contains("SNAPSHOT")
+    def mavenCentralRepo = isSnapshot ?
+        'https://oss.sonatype.org/content/repositories/snapshots/' :
+        'https://oss.sonatype.org/service/local/staging/deploy/maven2';
 
     project.archivesBaseName="jposee-${project.name}"
+    javadoc.failOnError = false
 
     def pomConfig = {
         name 'jPOS-EE Project'
@@ -37,7 +50,7 @@ subprojects {
             url 'https://jpos.org/issues'
         }
         scm {
-            url "http://github.com/jpos/jPOS"
+            url "https://github.com/jpos/jPOS"
             connection "scm:git:https://github.com/jpos/jPOS-EE.git"
             developerConnection "scm:git:git@github.com:jpos/jPOS-EE.git"
         }
@@ -58,17 +71,34 @@ subprojects {
         }
     }
 
+    configure(install.repositories.mavenInstaller) {
+        pom.project pomConfig
+    }
+    signing {
+        required { !isSnapshot }
+        sign configurations.archives
+    }
     uploadArchives {
         repositories {
             mavenDeployer {
                 pom.project pomConfig
+                beforeDeployment { MavenDeployment deployment -> signing.signPom(deployment) }
                 repository(url: 'file:///opt/local/maven')
+                /*
+                repository(url: mavenCentralRepo) {
+                    authentication(userName: mavenCentralUsername, password: mavenCentralPassword)
+                }
+                */
             }
         }
     }
+    test {
+        useJUnitPlatform()
+        maxParallelForks = Runtime.runtime.availableProcessors()
+    }
     task sourceJar(type: Jar) {
         from sourceSets.main.allSource
-        classifier = 'sources'
+        archiveClassifier.set('sources')
     }
 
     artifacts {
@@ -76,28 +106,31 @@ subprojects {
     }
 
     repositories {
-        mavenLocal()
         mavenCentral()
-        mavenRepo url: "http://jpos.org/maven"
-        mavenRepo url: "http://download.oracle.com/maven"
-        mavenRepo url: "http://jline.sourceforge.net/m2repo"
-        mavenRepo url: "https://repository.jboss.org/nexus/content/repositories/releases"
-        mavenRepo url: "http://repository.atlassian.com/maven2"
+        maven { url 'https://jpos.org/maven' }
+        maven { url 'https://download.oracle.com/maven' }
+        maven { url 'https://maven.vaadin.com/vaadin-addons' }
+        maven { url 'https://maven.vaadin.com/vaadin-prereleases' }
+        jcenter()
+        mavenLocal()
     }
 
     dependencies {
-        testCompile libraries.junit
+        testImplementation libraries.junit
+        //Java 10 support
+        testImplementation('com.sun.xml.bind:jaxb-impl:2.1.2')
+        testImplementation('com.sun.activation:javax.activation:1.2.0')
+        testImplementation('javax.xml.bind:jaxb-api:2.3.0')
     }
+
+    task allDeps(type: DependencyReportTask) {}
 }
+
 task allSources(type: Jar,dependsOn: subprojects.assemble) {
-    baseName = 'jposee-sources'
+    archiveBaseName = 'jposee-sources'
     from subprojects.collect { project ->
         project.sourceSets.main.allSource
     }
-}
-
-task wrapper( type: Wrapper ) {
-    gradleVersion = '1.6'
 }
 
 // Configure IDEA to use Git

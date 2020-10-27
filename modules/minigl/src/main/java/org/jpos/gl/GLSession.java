@@ -1,6 +1,6 @@
 /*
  * jPOS Project [http://jpos.org]
- * Copyright (C) 2000-2013 Alejandro P. Revilla
+ * Copyright (C) 2000-2020 jPOS Software SRL
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU Affero General Public License as
@@ -18,6 +18,7 @@
 
 package org.jpos.gl;
 
+import java.math.BigInteger;
 import java.util.*;
 import java.math.BigDecimal;
 
@@ -26,6 +27,9 @@ import org.hibernate.criterion.Order;
 import org.hibernate.criterion.Projections;
 import org.hibernate.criterion.Restrictions;
 import org.hibernate.criterion.Disjunction;
+import org.hibernate.dialect.Dialect;
+import org.hibernate.exception.ConstraintViolationException;
+import org.hibernate.transform.AliasToEntityMapResultTransformer;
 import org.hibernate.type.LongType;
 
 
@@ -44,6 +48,20 @@ public class GLSession {
     public static final short[] LAYER_ZERO = new short[] { 0 };
     public static final BigDecimal ZERO = new BigDecimal ("0.00");
     public static final BigDecimal Z    = new BigDecimal ("0");
+    private long SAFE_WINDOW = 1000L;
+    private boolean ignoreBalanceCache = false;
+    private boolean strictAccountCodes = true;
+    private NativeDialect nativeDialect = NativeDialect.ORM;
+
+    private static String POSTGRESQL_GET_BALANCES =
+      "SELECT SUM(CASE WHEN entry.credit='N' THEN entry.amount ELSE -entry.amount end) AS balance,\n" +
+      " COUNT(entry.id) AS count\n" +
+      " FROM transentry AS entry\n";
+
+    private static String MYSQL_GET_BALANCES =
+      "SELECT SUM(if(entry.credit='N',entry.amount,-entry.amount)) AS balance,\n" +
+        "  COUNT(entry.id) AS count\n" +
+        "  from transentry as entry\n";
 
     /**
      * Construct a GLSession for a given user.
@@ -55,17 +73,18 @@ public class GLSession {
      * @throws org.hibernate.HibernateException on database problems
      * @throws GLException if user is not valid
      */
-    public GLSession (String username) 
+    public GLSession (String username)
         throws HibernateException, GLException
     {
         super();
         this.db = new DB();
         session = db.open();
+        setDialect();
         if (username != null) {
             user = getUser (username);
             if (user == null) {
                close();
-               throw new GLException ("Invalid user '" + username + "'");
+               throw new InvalidGLUserException(username);
             }
         }
     }
@@ -90,7 +109,7 @@ public class GLSession {
      * @throws HibernateException on database related issue
      * @throws GLException if user is invalid
      */
-    public GLSession (DB db, String username) 
+    public GLSession (DB db, String username)
         throws HibernateException, GLException
     {
         super();
@@ -101,12 +120,13 @@ public class GLSession {
             autoClose = !autoClose;
         }
         session = db.session();
+        setDialect();
         if (username != null) {
             user = getUser (username);
             if (user == null) {
                 if (autoClose)
                     close();
-               throw new GLException ("Invalid user '" + username + "'");
+               throw new InvalidGLUserException(username);
             }
         }
     }
@@ -143,7 +163,7 @@ public class GLSession {
     public void checkPermission (String action) throws GLException {
         if (!hasPermission (action)) {
             throw new GLException (
-                "User '" + user.getName() + "' (" + user.getId() + 
+                "User '" + user.getName() + "' (" + user.getId() +
                 ") does not have '" + action + "' permission."
             );
         }
@@ -156,7 +176,7 @@ public class GLSession {
      * @param userName user name
      * @param permName permission name
      */
-    public void grant (String userName, String permName) 
+    public void grant (String userName, String permName)
         throws GLException, HibernateException
     {
         checkPermission (GLPermission.GRANT);
@@ -174,7 +194,7 @@ public class GLSession {
      * @param userName user name
      * @param permName permission name
      */
-    public void revoke (String userName, String permName) 
+    public void revoke (String userName, String permName)
         throws GLException, HibernateException
     {
         checkPermission (GLPermission.GRANT);
@@ -227,8 +247,8 @@ public class GLSession {
     public void checkPermission (String action, Journal j) throws GLException {
         if (!hasPermission (action, j)) {
             throw new GLException (
-                "User '" + user.getName() + "' (" + user.getId() + 
-                ") does not have '" + action + "' permission in journal '" + 
+                "User '" + user.getNick() + "' (" + user.getName() +
+                ") does not have '" + action + "' permission in journal '" +
                 j.getName() + "' (" + j.getId() + ")"
             );
         }
@@ -240,7 +260,7 @@ public class GLSession {
      * @throws GLException if users doesn't have global READ permission.
      * @see GLPermission
      */
-    public Account getChart (String code) 
+    public Account getChart (String code)
         throws HibernateException, GLException
     {
         checkPermission (GLPermission.READ);
@@ -258,7 +278,7 @@ public class GLSession {
      * @see GLPermission
      */
     public List<Account> getCharts ()
-        throws HibernateException, GLException 
+        throws HibernateException, GLException
     {
         checkPermission (GLPermission.READ);
         Query q = session.createQuery(
@@ -276,7 +296,7 @@ public class GLSession {
      * @throws GLException if users doesn't have global READ permission.
      * @see GLPermission
      */
-    public Account getAccount (Account chart, String code) 
+    public Account getAccount (Account chart, String code)
         throws HibernateException, GLException
     {
         checkPermission (GLPermission.READ);
@@ -298,11 +318,12 @@ public class GLSession {
      * @throws HibernateException on error
      * @throws GLException if user doesn't have permissions, or type mismatch
      */
-    public void addAccount (CompositeAccount parent, Account acct) 
+    public void addAccount (CompositeAccount parent, Account acct)
         throws HibernateException, GLException
     {
-        addAccount (parent, acct, false);
+        addAccount (parent, acct, true);
     }
+
     /**
      * Add account to parent.
      * Check permissions, parent's type and optional currency.
@@ -311,13 +332,16 @@ public class GLSession {
      * @param acct account to add
      * @param fast true if we want a fast add that do not eagerly load all childrens
      * @throws HibernateException on error
-     * @throws GLException if user doesn't have permissions, or type mismatch
+     * @throws GLException if user doesn't have permissions, type mismatch or Duplicate Code
      */
     @SuppressWarnings("unchecked")
-    public void addAccount (CompositeAccount parent, Account acct, boolean fast) 
+    public void addAccount (CompositeAccount parent, Account acct, boolean fast)
         throws HibernateException, GLException
     {
         checkPermission (GLPermission.WRITE);
+        if (strictAccountCodes)
+            validateAccountCode(parent, acct);
+
         if (!parent.isChart() && !parent.equalsType (acct)) {
             StringBuffer sb = new StringBuffer ("Type mismatch ");
             sb.append (parent.getTypeAsString());
@@ -326,8 +350,8 @@ public class GLSession {
             throw new GLException (sb.toString());
         }
         String currencyCode = parent.getCurrencyCode();
-        if (currencyCode != null 
-            && !currencyCode.equals (acct.getCurrencyCode())) 
+        if (currencyCode != null
+            && !currencyCode.equals (acct.getCurrencyCode()))
         {
             StringBuffer sb = new StringBuffer ("Currency mismatch ");
             sb.append (currencyCode);
@@ -336,7 +360,13 @@ public class GLSession {
             throw new GLException (sb.toString());
         }
         acct.setRoot (parent.getRoot());
-        session.save (acct);
+        try {
+            session.save (acct);
+            session.flush();
+        } catch (ConstraintViolationException e) {
+            e.fillInStackTrace();
+            throw new GLException("Duplicate code", e);
+        }
         acct.setParent (parent);
         if (!fast)
             parent.getChildren().add (acct);
@@ -350,8 +380,8 @@ public class GLSession {
      * @throws HibernateException on error
      * @throws GLException if user doesn't have write permission
      */
-    public void addChart (Account acct) 
-        throws HibernateException, GLException 
+    public void addChart (Account acct)
+        throws HibernateException, GLException
     {
         checkPermission (GLPermission.WRITE);
         session.save (acct);
@@ -412,7 +442,7 @@ public class GLSession {
     }
     /**
      * @param parent parent account.
-     * @return list of composite accounts children of the parent account
+     * @return list of final accounts children of the parent account
      * @throws HibernateException on database errors.
      * @throws GLException if users doesn't have global READ permission.
      * @see GLPermission
@@ -452,7 +482,7 @@ public class GLSession {
      * @throws GLException if users doesn't have global READ permission.
      * @see GLPermission
      */
-    public CompositeAccount getCompositeAccount (Account chart, String code) 
+    public CompositeAccount getCompositeAccount (Account chart, String code)
         throws HibernateException, GLException
     {
         checkPermission (GLPermission.READ);
@@ -473,7 +503,7 @@ public class GLSession {
      * @throws GLException if users doesn't have global READ permission.
      * @see GLPermission
      */
-    public Account getAccount (String chartName, String code) 
+    public Account getAccount (String chartName, String code)
         throws HibernateException, GLException
     {
         Account chart = getChart(chartName);
@@ -490,7 +520,7 @@ public class GLSession {
      * @throws GLException if users doesn't have global READ permission.
      * @see GLPermission
      */
-    public FinalAccount getFinalAccount (String chartName, String code) 
+    public FinalAccount getFinalAccount (String chartName, String code)
         throws HibernateException, GLException
     {
         Account chart = getChart(chartName);
@@ -507,7 +537,7 @@ public class GLSession {
      * @throws GLException if users doesn't have global READ permission.
      * @see GLPermission
      */
-    public CompositeAccount getCompositeAccount (String chartName, String code) 
+    public CompositeAccount getCompositeAccount (String chartName, String code)
         throws HibernateException, GLException
     {
         Account chart = getChart(chartName);
@@ -523,7 +553,7 @@ public class GLSession {
      * @throws HibernateException on database errors.
      * @see GLPermission
      */
-    public Journal getJournal (String name) 
+    public Journal getJournal (String name)
         throws HibernateException, GLException
     {
         Query q = session.createQuery (
@@ -555,6 +585,17 @@ public class GLSession {
     }
 
     /**
+     * @return list of all currency ids
+     * @see org.jpos.gl.Currency
+     */
+    public List<String> getCurrencyCodes() {
+        return db.session()
+                .createCriteria(Currency.class)
+                .setProjection(Projections.id())
+                .list();
+    }
+
+    /**
      * Post transaction in a given journal.
      *
      * @param journal the journal.
@@ -564,7 +605,7 @@ public class GLSession {
      * @see GLPermission
      * @see JournalRule
      */
-    public void post (Journal journal, GLTransaction txn) 
+    public void post (Journal journal, GLTransaction txn)
         throws HibernateException, GLException
     {
         checkPermission (GLPermission.POST, journal);
@@ -586,7 +627,7 @@ public class GLSession {
      * @throws GLException if user doesn't have POST permission on the old and new journals.
      * @throws HibernateException on database errors.
      */
-    public void move (GLTransaction txn, Journal journal) 
+    public void move (GLTransaction txn, Journal journal)
         throws GLException, HibernateException
     {
         checkPermission (GLPermission.POST, journal);
@@ -609,8 +650,8 @@ public class GLSession {
      * @throws GLException if user doesn't have READ permission on this journal.
      * @throws HibernateException on database/mapping errors
      */
-    public GLTransaction summarize 
-        (Journal journal, Date start, Date end, String description, short[] layers) 
+    public GLTransaction summarize
+        (Journal journal, Date start, Date end, String description, short[] layers)
         throws HibernateException, GLException
     {
         checkPermission (GLPermission.SUMMARIZE, journal);
@@ -618,12 +659,12 @@ public class GLSession {
         end   = Util.ceil (end);
 
         if (end.compareTo (start) < 0) {
-            throw new GLException ("Invalid date range " 
+            throw new GLException ("Invalid date range "
                 + Util.dateToString(start) + ":" + Util.dateToString (end));
         }
         Date lockDate = journal.getLockDate();
         if (lockDate != null && start.compareTo (lockDate) <= 0) {
-            throw new GLException 
+            throw new GLException
                 ("Journal is locked at " + Util.dateToString (lockDate));
         }
         setLockDate (journal, end);
@@ -635,16 +676,16 @@ public class GLSession {
             while (debits.hasNext()) {
                 Object[] obj = (Object[]) debits.next();
                 txn.createDebit (
-                    (FinalAccount) obj[0], 
-                    (BigDecimal) obj[1], 
+                    (FinalAccount) obj[0],
+                    (BigDecimal) obj[1],
                     null, layers[i]
                 );
             }
             while (credits.hasNext()) {
                 Object[] obj = (Object[]) credits.next();
                 txn.createCredit (
-                    (FinalAccount) obj[0], 
-                    (BigDecimal) obj[1], 
+                    (FinalAccount) obj[0],
+                    (BigDecimal) obj[1],
                     null, layers[i]
                 );
             }
@@ -670,7 +711,7 @@ public class GLSession {
         GLTransaction txn = null;
         checkPermission (GLPermission.READ, journal);
         try {
-            txn = (GLTransaction) 
+            txn = (GLTransaction)
                 session.load (GLTransaction.class, new Long(id));
             if (!txn.getJournal().equals(journal))
                 throw new GLException (
@@ -781,7 +822,7 @@ public class GLSession {
      * @return list of transactions
      * @throws GLException if user doesn't have READ permission on this journal.
      */
-    public List findTransactions 
+    public List findTransactions
         (Journal journal, Date start, Date end, String searchString, boolean findByPostDate)
         throws HibernateException, GLException
     {
@@ -880,7 +921,7 @@ public class GLSession {
      * @return current balance.
      * @throws GLException if user doesn't have READ permission on this jounral.
      */
-    public BigDecimal getBalance (Journal journal, Account acct) 
+    public BigDecimal getBalance (Journal journal, Account acct)
         throws HibernateException, GLException
     {
         return getBalances (journal, acct, null, true) [0];
@@ -891,9 +932,9 @@ public class GLSession {
      * @param acct the account.
      * @param layer the layers.
      * @return current balance.
-     * @throws GLException if user doesn't have READ permission on this jounral.
+     * @throws GLException if user doesn't have READ permission on this journal.
      */
-    public BigDecimal getBalance (Journal journal, Account acct, short layer) 
+    public BigDecimal getBalance (Journal journal, Account acct, short layer)
         throws HibernateException, GLException
     {
         return getBalances (journal, acct, null, true, new short[] { layer }, 0L) [0];
@@ -904,9 +945,9 @@ public class GLSession {
      * @param acct the account.
      * @param layers the layers.
      * @return current balance.
-     * @throws GLException if user doesn't have READ permission on this jounral.
+     * @throws GLException if user doesn't have READ permission on this journal.
      */
-    public BigDecimal getBalance (Journal journal, Account acct, short[] layers) 
+    public BigDecimal getBalance (Journal journal, Account acct, short[] layers)
         throws HibernateException, GLException
     {
         return getBalances (journal, acct, null, true, layers, 0L) [0];
@@ -917,9 +958,9 @@ public class GLSession {
      * @param acct the account.
      * @param layers comma separated list of layers
      * @return current balance.
-     * @throws GLException if user doesn't have READ permission on this jounral.
+     * @throws GLException if user doesn't have READ permission on this journal.
      */
-    public BigDecimal getBalance (Journal journal, Account acct, String layers) 
+    public BigDecimal getBalance (Journal journal, Account acct, String layers)
         throws HibernateException, GLException
     {
         return getBalances (journal, acct, null, true, toLayers(layers), 0L) [0];
@@ -930,9 +971,9 @@ public class GLSession {
      * @param acct the account.
      * @param date date (inclusive).
      * @return balance at given date.
-     * @throws GLException if user doesn't have READ permission on this jounral.
+     * @throws GLException if user doesn't have READ permission on this journal.
      */
-    public BigDecimal getBalance (Journal journal, Account acct, Date date) 
+    public BigDecimal getBalance (Journal journal, Account acct, Date date)
         throws HibernateException, GLException
     {
         return getBalances (journal, acct, date, true) [0];
@@ -944,9 +985,9 @@ public class GLSession {
      * @param date date (inclusive).
      * @param layer layer
      * @return balance at given date.
-     * @throws GLException if user doesn't have READ permission on this jounral.
+     * @throws GLException if user doesn't have READ permission on this journal.
      */
-    public BigDecimal getBalance (Journal journal, Account acct, Date date, short layer) 
+    public BigDecimal getBalance (Journal journal, Account acct, Date date, short layer)
         throws HibernateException, GLException
     {
         return getBalances (journal, acct, date, true, new short[] { layer }, 0L) [0];
@@ -958,12 +999,26 @@ public class GLSession {
      * @param date date (inclusive).
      * @param layers layers
      * @return balance at given date.
-     * @throws GLException if user doesn't have READ permission on this jounral.
+     * @throws GLException if user doesn't have READ permission on this journal.
      */
-    public BigDecimal getBalance (Journal journal, Account acct, Date date, short[] layers) 
+    public BigDecimal getBalance (Journal journal, Account acct, Date date, short[] layers)
         throws HibernateException, GLException
     {
         return getBalances (journal, acct, date, true, layers, 0L) [0];
+    }
+    /**
+     * Balance for account in a given journal in a given date.
+     * @param journal the journal.
+     * @param acct the account.
+     * @param date date (inclusive).
+     * @param layers comma separated list of layers
+     * @return balance at given date.
+     * @throws GLException if user doesn't have READ permission on this journal.
+     */
+    public BigDecimal getBalance (Journal journal, Account acct, Date date, String layers)
+        throws HibernateException, GLException
+    {
+        return getBalances (journal, acct, date, true, toLayers(layers), 0L) [0];
     }
     /**
      * Get Both Balances at given date
@@ -972,14 +1027,15 @@ public class GLSession {
      * @param date date (inclusive).
      * @param inclusive either true or false
      * @return array of 2 BigDecimals with balance and entry count.
-     * @throws GLException if user doesn't have READ permission on this jounral.
+     * @throws GLException if user doesn't have READ permission on this journal.
      */
-    public BigDecimal[] getBalances 
-        (Journal journal, Account acct, Date date, boolean inclusive) 
+    public BigDecimal[] getBalances
+        (Journal journal, Account acct, Date date, boolean inclusive)
         throws HibernateException, GLException
     {
         return getBalances (journal, acct, date, inclusive, LAYER_ZERO, 0L);
     }
+
 
     /**
      * Get Both Balances at given date
@@ -990,31 +1046,32 @@ public class GLSession {
      * @param layers the layers
      * @param maxId maximum GLEntry ID to be considered in the query (if greater than zero)
      * @return array of 2 BigDecimals with balance and entry count.
-     * @throws GLException if user doesn't have READ permission on this jounral.
+     * @throws GLException if user doesn't have READ permission on this journal.
      */
-    public BigDecimal[] getBalances 
-        (Journal journal, Account acct, Date date, boolean inclusive, short[] layers, long maxId) 
+    public BigDecimal[] getBalancesORM
+        (Journal journal, Account acct, Date date, boolean inclusive, short[] layers, long maxId)
         throws HibernateException, GLException
     {
         checkPermission (GLPermission.READ, journal);
         BigDecimal balance[] = { ZERO, Z };
+        short[] layersCopy = Arrays.copyOf(layers,layers.length);
         if (acct.getChildren() != null) {
             if (acct.isChart()) {
-                return getChartBalances 
-                    (journal, (CompositeAccount) acct, date, inclusive, layers, maxId);
+                return getChartBalances
+                    (journal, (CompositeAccount) acct, date, inclusive, layersCopy, maxId);
             }
             Iterator iter = acct.getChildren().iterator();
             while (iter.hasNext()) {
                 Account a = (Account) iter.next();
-                BigDecimal[] b = getBalances (journal, a, date, inclusive, layers, maxId);
+                BigDecimal[] b = getBalancesORM (journal, a, date, inclusive, layersCopy, maxId);
                 balance[0] = balance[0].add (b[0]);
-                // session.evict (a); FIXME this conflicts with r251 (cascade=evict genearting a failed to lazily initialize a collection
+                // session.evict (a); FIXME this conflicts with r251 (cascade=evict generating a failed to lazily initialize a collection
             }
         }
         else if (acct.isFinalAccount()) {
             Criteria entryCrit = session.createCriteria (GLEntry.class)
                 .add (Restrictions.eq ("account", acct))
-                .add (Restrictions.in ("layer", toShortArray (layers)));
+                .add (Restrictions.in ("layer", (Object[])toShortArray (layersCopy)));
             if (maxId > 0L)
                 entryCrit.add (Restrictions.le ("id", maxId));
 
@@ -1028,15 +1085,14 @@ public class GLSession {
                     date = Util.floor (date);
                     txnCrit.add (Restrictions.lt ("postDate", date));
                 }
-                Checkpoint chkp = getRecentCheckpoint (journal, acct, date, inclusive, layers);
+                Checkpoint chkp = getRecentCheckpoint (journal, acct, date, inclusive, layersCopy);
                 if (chkp != null) {
                     balance[0] = chkp.getBalance();
-                    txnCrit.add (Restrictions.gt ("postDate", chkp.getDate()));
+                    txnCrit.add (Restrictions.ge ("postDate", chkp.getDate()));
                 }
-
-            } else {
-                BalanceCache bcache = getBalanceCache (journal, acct, layers);
-                if (bcache != null) {
+            } else if (!ignoreBalanceCache) {
+                BalanceCache bcache = getBalanceCache (journal, acct, layersCopy);
+                if (bcache != null && (maxId == 0 || bcache.getRef() <= maxId)) {
                     balance[0] = bcache.getBalance();
                     entryCrit.add (Restrictions.gt("id", bcache.getRef()));
                 }
@@ -1044,8 +1100,152 @@ public class GLSession {
             List l = txnCrit.list();
             balance[0] = applyEntries (balance[0], l);
             balance[1] = new BigDecimal (l.size()); // hint for checkpoint
-        } 
+        }
         return balance;
+    }
+
+    /**
+     * Get Both Balances at given date.
+     *
+     * IMPORTANT NOTE: This function uses different implementations depending on the
+     * dialect of the SQL server in use.  By default, native queries are generated for
+     * the MySQL and PostgreSQL dialect, with other dialects using getBalancesORM instead.
+     *
+     * Regarding balances of composite accounts - getBalancesORM knows that a given account
+     * is a child of a given parent correctly using the acct.parent reference, whereas the
+     * native queries in getBalances cut some corners in order to take advantage of the
+     * database index, it assumes that the parent shares the acct.code prefix.
+     *
+     * In such cases, if MySQL or PostgreSQL native queries are used for balance calculations,
+     * accounts not following this convention are excluded from the results resulting in the
+     * wrong balance.  This was the reason for adding stricter checks of account codes to
+     * Import.createCharts and GLSession.addAccount.
+     *
+     * It's possible to force the use of getBalancesORM by calling `GLSession.forceDialect`
+     *
+     * @param journal the journal.
+     * @param acct the account.
+     * @param date date (inclusive).
+     * @param inclusive either true or false
+     * @param layers the layers
+     * @param maxId maximum GLEntry ID to be considered in the query (if greater than zero)
+     * @return array of 2 BigDecimals with balance and entry count.
+     * @throws GLException if user doesn't have READ permission on this journal.
+     */
+    public BigDecimal[] getBalances
+      (Journal journal, Account acct, Date date, boolean inclusive, short[] layers, long maxId)
+      throws HibernateException, GLException
+    {
+        StringBuilder select;
+        switch (nativeDialect) {
+            case MYSQL:
+                select = new StringBuilder(MYSQL_GET_BALANCES);
+                break;
+            case POSTGRESQL:
+                select = new StringBuilder(POSTGRESQL_GET_BALANCES);
+                break;
+            default:
+                return getBalancesORM(journal, acct, date, inclusive, layers, maxId);
+        }
+
+        checkPermission (GLPermission.READ, journal);
+        BigDecimal balance[] = { ZERO, Z };
+        BalanceCache bcache = null;
+        select.append(", transacc as txn\n");
+
+        if (date == null && !ignoreBalanceCache) {
+            short[] layersCopy = Arrays.copyOf(layers,layers.length);
+            bcache = getBalanceCache(journal, acct, layersCopy);
+            if (maxId > 0 && bcache != null && bcache.getRef() > maxId)
+                bcache = null; // ignore bcache 'in the future'
+        }
+        if (!acct.isFinalAccount()) {
+            select.append(", acct as acct");
+        }
+        StringBuffer qs = new StringBuffer();
+        if (maxId > 0L) {
+            where(qs, "entry.id <= :maxId");
+        }
+        if (bcache != null) {
+            where(qs, "entry.id > :bcache_ref");
+        }
+        if (acct.isFinalAccount()) {
+            where(qs, "entry.account = :acctId");
+        }
+        else if (acct.isChart()) {
+            where(qs, "entry.account = acct.id");
+            where(qs, "acct.root = :acctId");
+        } else {
+            where(qs, "entry.account = acct.id");
+            where(qs, "acct.code like :code");
+        }
+        where(qs, "(entry.transaction = txn.id and txn.journal = :journal)\n");
+        if  (date != null) {
+            where(qs, "txn.postDate < :date");
+        }
+        where(qs, "entry.layer in");
+        qs.append("  (");
+        qs.append(layersToString(layers, ','));
+        qs.append(')');
+        select.append(qs);
+
+        Query q = session.createSQLQuery(select.toString());
+        q.setResultTransformer(AliasToEntityMapResultTransformer.INSTANCE);
+        if (acct.isFinalAccount() || acct.isChart())
+            q.setParameter("acctId", acct.getId());
+        else {
+            q.setParameter("code", acct.getCode() + "%");
+        }
+        q.setParameter("journal", journal.getId());
+        if (date != null) {
+            q.setParameter("date", inclusive ? Util.tomorrow(date) : date);
+        }
+        if (maxId > 0L)
+            q.setParameter("maxId", maxId);
+        if (bcache != null)
+            q.setParameter("bcache_ref", bcache.getRef());
+
+        List<Map<String,Object>> result = q.list();
+        if (result.size() == 1) {
+            Map m = result.get(0);
+            BigDecimal bd = (BigDecimal) m.get("balance");
+            if (bd != null) {
+                balance[0] = bd;
+                balance[1] = new BigDecimal((BigInteger) m.get("count"));
+                if (acct.isCredit())
+                    balance[0] = balance[0].negate();
+            }
+        }
+        if (bcache != null) {
+            balance[0] = balance[0].add(bcache.getBalance());
+        }
+        return balance;
+    }
+
+    public List<FinalAccount> getDeepFinalChildren(Account acct) throws HibernateException, GLException {
+        checkPermission (GLPermission.READ);
+        return getDeepFinalChildren0(acct);
+    }
+
+
+    private StringBuffer where (StringBuffer sb, String clausse) {
+        sb.append(sb.length() == 0 ? " WHERE " : " AND ");
+        sb.append(clausse);
+        sb.append('\n');
+        return sb;
+    }
+    private String layersToString (short[] layers, char sep) {
+        StringBuffer sb = new StringBuffer();
+        Arrays.sort (layers);
+        for (int i=0; i<layers.length; i++) {
+            if (i>0)
+                sb.append (sep);
+            sb.append (layers[i]);
+        }
+        return sb.toString();
+    }
+    private String layersToString (short[] layers) {
+        return layersToString(layers, '.');
     }
 
     /**
@@ -1054,21 +1254,21 @@ public class GLSession {
      * @param acct the account.
      * @param start date (inclusive).
      * @param end date (inclusive).
+     * @param layers array of the layers included.
+     * @param ascendingOrder boolean.
+     * @param maxResults int.
      * @return Account detail for given period.
-     * @throws GLException if user doesn't have READ permission on this jounral.
+     * @throws GLException if user doesn't have READ permission on this journal.
      */
-    public AccountDetail getAccountDetail 
-        (Journal journal, Account acct, Date start, Date end, short[] layers) 
+    public AccountDetail getAccountDetail
+        (Journal journal, Account acct, Date start, Date end, short[] layers, boolean ascendingOrder, int maxResults)
         throws HibernateException, GLException
     {
         checkPermission (GLPermission.READ);
-        start = Util.floor (start);
-        end   = Util.ceil (end);
-
         Criteria crit = session.createCriteria (GLEntry.class);
 
         boolean hasChildren = false;
-        if (acct instanceof CompositeAccount) {
+        if (acct.isCompositeAccount()) {
             Disjunction dis = Restrictions.disjunction();
             for (Long l : getChildren (acct)) {
                 hasChildren = true;
@@ -1077,61 +1277,119 @@ public class GLSession {
             if (hasChildren) {
                 Criteria subCrit = crit.createCriteria(("account"));
                 subCrit.add (dis);
-            } 
+            }
         }
         if (!hasChildren) {
             crit.add (Restrictions.eq ("account", acct));
         }
 
-        crit.add (Restrictions.in ("layer", toShortArray (layers)));
+        crit.add (Restrictions.in ("layer", (Object[])toShortArray (layers)));
         crit = crit.createCriteria ("transaction")
-            .add (Restrictions.eq ("journal", journal))
-            .add (Restrictions.ge ("postDate", start))
-            .add (Restrictions.le ("postDate", end));
+            .add (Restrictions.eq ("journal", journal));
 
-        BigDecimal initialBalance[] = getBalances (journal, acct, start, false, layers, 0L);
-        crit.addOrder (Order.asc ("postDate"));
-        crit.addOrder (Order.asc ("timestamp"));
-        crit.addOrder (Order.asc ("id"));
-        List entries = crit.list();
-        // BigDecimal finalBalance = applyEntries (initialBalance[0], entries);
+        if (start != null || (start == null && ascendingOrder)) {
+            start = Util.floor(start);
+            crit.add (Restrictions.ge ("postDate", start));
+        }
+        if (end != null || (end == null && ascendingOrder)) {
+            end = Util.ceil(end);
+            crit.add (Restrictions.le ("postDate", end));
+        }
 
-        return new AccountDetail (
-                journal, acct, 
-                initialBalance[0],
-                start, end, entries, layers );
+        if (maxResults > 0)
+            crit.setMaxResults(maxResults);
+
+        long maxEntry = 0L;
+        List <GLEntry>  entries;
+        BigDecimal initialBalance[];
+        if (ascendingOrder) {
+            crit.addOrder (Order.asc ("postDate"));
+            crit.addOrder (Order.asc ("timestamp"));
+            crit.addOrder (Order.asc ("id"));
+            entries = crit.list();
+            initialBalance = getBalances(journal, acct, start, false, layers, maxEntry);
+        } else {
+            crit.addOrder (Order.desc ("postDate"));
+            crit.addOrder (Order.desc ("timestamp"));
+            crit.addOrder (Order.desc ("id"));
+            entries = crit.list();
+            if (entries.size() > 0) {
+                maxEntry = entries.get(0).getId();
+            }
+            initialBalance = getBalances(journal, acct, end, true, layers, maxEntry);
+        }
+        return new AccountDetail(journal, acct, initialBalance[0], start, end, entries, layers, ascendingOrder);
     }
+
+
+    /**
+     * AccountDetail for date range
+     * @param journal the journal.
+     * @param acct the account.
+     * @param start date (inclusive).
+     * @param end date (inclusive).
+     * @return Account detail for given period.
+     * @throws GLException if user doesn't have READ permission on this journal.
+     */
+    public AccountDetail getAccountDetail
+    (Journal journal, Account acct, Date start, Date end, short[] layers)
+            throws HibernateException, GLException
+    {
+        return getAccountDetail(journal, acct, start, end, layers, true, 0);
+    }
+
+    /**
+     * AccountDetail for date range
+     * @param journal the journal.
+     * @param acct the account.
+     * @param layers layer set
+     * @param maxResults number of entries in mini statement
+     * @return Account detail for given period.
+     * @throws GLException if user doesn't have READ permission on this journal.
+     */
+    public AccountDetail getMiniStatement
+    (Journal journal, Account acct, short[] layers, int maxResults)
+            throws HibernateException, GLException
+    {
+        return getAccountDetail(journal, acct, null, null, layers, false, maxResults);
+    }
+
+
     /**
      * @param journal the journal.
      * @param acct the account.
      * @param date date (null for last checkpoint)
      * @param inclusive either true or false
      * @return Most recent check point for given date.
-     * @throws GLException if user doesn't have CHECKPOINT permission on this jounral.
+     * @throws GLException if user doesn't have CHECKPOINT permission on this journal.
      */
     public Checkpoint getRecentCheckpoint
-        (Journal journal, Account acct, Date date, boolean inclusive, short[] layers) 
+        (Journal journal, Account acct, Date date, boolean inclusive, short[] layers)
         throws HibernateException, GLException
     {
         checkPermission (GLPermission.CHECKPOINT, journal);
 
-        Criteria crit = session.createCriteria (Checkpoint.class)
-            .add (Restrictions.eq ("journal", journal))
-            .add (Restrictions.eq ("account", acct));
+        String qryString= "from org.jpos.gl.Checkpoint where journal = :journal and account = :account "
+                + ( (layers == null) ? "" : "and layers = :layers " )
+                + ( (date == null) ? "" :
+                    inclusive ? " and date <= :date " : " and date < :date ")
+                + "order by date desc";
 
+        org.hibernate.query.Query<Checkpoint> q= session.createQuery(qryString, Checkpoint.class);
+        q.setParameter("journal", journal);
+        q.setParameter("account", acct);
         if (layers != null)
-           crit.add (Restrictions.eq ("layers", layersToString(layers)));
+            q.setParameter("layers", layersToString(layers));
+        if (date != null)
+            q.setParameter("date", date);
 
-        if (date != null) {
-           if (inclusive)
-               crit.add (Restrictions.le ("date", date));
-           else
-               crit.add (Restrictions.lt ("date", date));
-        }
-        crit.addOrder (Order.desc ("date"));
-        crit.setMaxResults (1); 
-        return (Checkpoint) crit.uniqueResult();
+        q.setMaxResults(1);
+        //q.setReadOnly(true);
+
+        return q.uniqueResult();
     }
+
+
     public BalanceCache getBalanceCache
         (Journal journal, Account acct, short[] layers)
         throws HibernateException, GLException
@@ -1148,16 +1406,16 @@ public class GLSession {
         crit.setMaxResults (1);
         return (BalanceCache) crit.uniqueResult();
     }
-    
+
 
     /**
      * @param journal the Journal
      * @param acct the account
      * @param date checkpoint date (inclusive)
      * @param threshold minimum number of  GLEntries required to create a checkpoint
-     * @throws GLException if user doesn't have CHECKPOINT permission on this jounral.
+     * @throws GLException if user doesn't have CHECKPOINT permission on this journal.
      */
-    public void createCheckpoint 
+    public void createCheckpoint
         (Journal journal, Account acct, Date date, int threshold)
         throws HibernateException, GLException
     {
@@ -1169,10 +1427,10 @@ public class GLSession {
      * @param date checkpoint date (inclusive)
      * @param layers taken into account in this checkpoint
      * @param threshold minimum number of  GLEntries required to create a checkpoint
-     * @throws GLException if user doesn't have CHECKPOINT permission on this jounral.
+     * @throws GLException if user doesn't have CHECKPOINT permission on this journal.
      */
-    public void createCheckpoint 
-        (Journal journal, Account acct, Date date, int threshold, short[] layers) 
+    public void createCheckpoint
+        (Journal journal, Account acct, Date date, int threshold, short[] layers)
         throws HibernateException, GLException
     {
         if (date == null)
@@ -1187,14 +1445,15 @@ public class GLSession {
         (Journal journal, Account acct, short[] layers)
         throws HibernateException, GLException
     {
-        return createBalanceCache (journal, acct, layers, getMaxGLEntryId());
+        createBalanceCache (journal, acct, layers, getSafeMaxGLEntryId());
+        return getBalance  (journal, acct, layers);
     }
-    public BigDecimal createBalanceCache
+    private BigDecimal createBalanceCache
         (Journal journal, Account acct, short[] layers, long maxId)
         throws HibernateException, GLException
     {
-        BigDecimal balance = null;
-        if (acct instanceof CompositeAccount) {
+        BigDecimal balance;
+        if (acct.isCompositeAccount()) {
             balance = ZERO;
             Iterator iter = ((CompositeAccount) acct).getChildren().iterator();
             while (iter.hasNext()) {
@@ -1202,7 +1461,7 @@ public class GLSession {
                 balance = balance.add (createBalanceCache (journal, a, layers, maxId));
             }
         }
-        else if (acct instanceof FinalAccount) {
+        else if (acct.isFinalAccount()) {
             lock (journal, acct);
             balance = getBalances (journal, acct, null, true, layers, maxId) [0];
             BalanceCache c = getBalanceCache (journal, acct, layers);
@@ -1218,16 +1477,16 @@ public class GLSession {
                 session.saveOrUpdate (c);
             }
         }
-        return balance;
+        return getBalance(journal, acct, layers);
     }
 
     /**
      * Lock a journal.
      * @param journal the journal.
      * @throws HibernateException on database errors.
-     * @throws GLException if user doesn't have POST permission on this jounral.
+     * @throws GLException if user doesn't have POST permission on this journal.
      */
-    public void lock (Journal journal) 
+    public void lock (Journal journal)
         throws HibernateException, GLException
     {
         checkPermission (GLPermission.POST, journal);
@@ -1237,23 +1496,23 @@ public class GLSession {
      * Lock an account in a given journal.
      * @param journal the journal.
      * @param acct the account.
-     * @throws GLException if user doesn't have POST permission on this jounral.
+     * @throws GLException if user doesn't have POST permission on this journal.
      * @throws HibernateException on database errors.
      */
-    public void lock (Journal journal, Account acct) 
+    public void lock (Journal journal, Account acct)
         throws HibernateException, GLException
     {
         checkPermission (GLPermission.POST, journal);
         AccountLock lck = getLock (journal, acct);
     }
-    
+
     /**
      * Open underlying Hibernate session.
      * @throws HibernateException
      */
     public synchronized Session open () throws HibernateException {
         return db.open();
-    }
+    }                                                           
     /**
      * Close underlying Hibernate session.
      * @throws HibernateException
@@ -1298,7 +1557,7 @@ public class GLSession {
      * @throws HibernateException on database errors.
      * @throws GLException if users doesn't have global READ permission.
      */
-    public void setLockDate (Journal journal, Date lockDate) 
+    public void setLockDate (Journal journal, Date lockDate)
         throws GLException, HibernateException
     {
         checkPermission (GLPermission.WRITE, journal);
@@ -1368,15 +1627,27 @@ public class GLSession {
         return balance;
     }
 
+    public boolean isIgnoreBalanceCache() {
+        return ignoreBalanceCache;
+    }
 
+    public void setIgnoreBalanceCache(boolean ignoreBalanceCache) {
+        this.ignoreBalanceCache = ignoreBalanceCache;
+    }
+
+    public boolean isEnforcingStrictAccountCodes() { return strictAccountCodes; }
+
+    public void setEnforceStrictAccountCodes(boolean strictAccountCodes) {
+        this.strictAccountCodes = strictAccountCodes;
+    }
 
     // -----------------------------------------------------------------------
-    // PUBLIC HELPERS 
+    // PUBLIC HELPERS
     // -----------------------------------------------------------------------
     public short[] toLayers (String layers) {
         StringTokenizer st = new StringTokenizer (layers, ", ");
         short[] sa = new short[st.countTokens()];
-        for (int i=0; st.hasMoreTokens(); i++) 
+        for (int i=0; st.hasMoreTokens(); i++)
             sa[i] = Short.parseShort (st.nextToken());
         return sa;
     }
@@ -1398,31 +1669,31 @@ public class GLSession {
         }
         return lck;
     }
-    private void createCheckpoint0 
-        (Journal journal, Account acct, Date date, int threshold, short[] layers) 
+    private void createCheckpoint0
+        (Journal journal, Account acct, Date date, int threshold, short[] layers)
         throws HibernateException, GLException
     {
-        if (acct instanceof CompositeAccount) {
+        if (acct.isCompositeAccount()) {
             Iterator iter = ((CompositeAccount) acct).getChildren().iterator();
             while (iter.hasNext()) {
                 Account a = (Account) iter.next();
                 createCheckpoint0 (journal, a, date, threshold, layers);
             }
         }
-        else if (acct instanceof FinalAccount) {
+        else if (acct.isFinalAccount()) {
             Date sod = Util.floor (date);   // sod = start of day
             invalidateCheckpoints (journal, new Account[] { acct }, sod, sod, layers);
-            BigDecimal b[] = getBalances (journal, acct, date, true, layers, 0L);
+            BigDecimal b[] = getBalances (journal, acct, sod, false, layers, 0L);
             if (b[1].intValue() >= threshold) {
                 Checkpoint c = new Checkpoint ();
-                c.setDate (date);
+                c.setDate (sod);
                 c.setBalance (b[0]);
                 c.setJournal (journal);
                 c.setAccount (acct);
                 c.setLayers (layersToString(layers));
                 session.save (c);
             }
-        } 
+        }
     }
     private Account[] getAccounts (GLTransaction txn) {
         List list = txn.getEntries();
@@ -1434,7 +1705,7 @@ public class GLSession {
         }
         return accounts;
     }
-    private List getAccountHierarchyIds (Account acct) 
+    private List getAccountHierarchyIds (Account acct)
         throws GLException
     {
         if (acct == null)
@@ -1448,7 +1719,7 @@ public class GLSession {
         return l;
     }
     private void invalidateCheckpoints (GLTransaction txn)
-        throws HibernateException 
+        throws HibernateException
     {
         Account[] accounts = getAccounts (txn);
         invalidateCheckpoints (
@@ -1456,13 +1727,13 @@ public class GLSession {
         );
     }
     private void invalidateCheckpoints
-        (Journal journal, Account[] accounts, Date start, Date end, short[] layers) 
+        (Journal journal, Account[] accounts, Date start, Date end, short[] layers)
         throws HibernateException
     {
         Criteria crit = session.createCriteria (Checkpoint.class)
             .add (Restrictions.eq ("journal", journal));
         if (accounts.length > 0)
-            crit = crit.add (Restrictions.in ("account", accounts));
+            crit = crit.add (Restrictions.in ("account", (Object[])accounts));
 
         if (layers != null)
             crit.add (Restrictions.eq ("layers", layersToString(layers)));
@@ -1479,9 +1750,8 @@ public class GLSession {
             Checkpoint cp = (Checkpoint) iter.next();
             session.delete (cp);
         }
-        session.flush();
     }
-    private BigDecimal applyEntries (BigDecimal balance, List entries) 
+    private BigDecimal applyEntries (BigDecimal balance, List entries)
         throws GLException
     {
         Iterator iter = entries.iterator();
@@ -1522,7 +1792,7 @@ public class GLSession {
     }
     private void addRules
         (Map<String,Object> ruleMap, Journal journal, List acctHierarchy, int offset)
-        throws HibernateException, GLException
+        throws HibernateException
     {
         Query q = session.createQuery (
             "from org.jpos.gl.RuleInfo where journal=:journal and account in (:accts) order by id"
@@ -1537,13 +1807,13 @@ public class GLSession {
             RuleInfo ri  = (RuleInfo) iter.next();
             RuleEntry k  = new RuleEntry (ri, ri.getAccount());
             RuleEntry re = (RuleEntry) ruleMap.get (k.getKey());
-            if (re == null) 
+            if (re == null)
                 ruleMap.put (k.getKey(), re = k);
 
             re.addOffset (offset);
         }
     }
-    private void applyRules (GLTransaction txn, Collection rules) 
+    private void applyRules (GLTransaction txn, Collection rules)
         throws HibernateException, GLException
     {
         Iterator iter = rules.iterator();
@@ -1552,12 +1822,12 @@ public class GLSession {
             RuleInfo  ri = re.getRuleInfo();
             JournalRule rule = (JournalRule) getRuleImpl (ri.getClazz());
             rule.check (
-                this, txn, ri.getParam(), re.getAccount(), 
+                this, txn, ri.getParam(), re.getAccount(),
                 re.getOffsets(), ri.getLayerArray()
             );
         }
     }
-    private Collection getRules (GLTransaction txn) 
+    private Collection getRules (GLTransaction txn)
         throws HibernateException, GLException
     {
         Map<String,Object> map = new LinkedHashMap<String,Object> ();
@@ -1576,12 +1846,12 @@ public class GLSession {
         iter = txn.getEntries().iterator();
         for (int i=0; iter.hasNext(); i++) {
             GLEntry entry = (GLEntry) iter.next();
-            addRules (map, journal, 
+            addRules (map, journal,
                 getAccountHierarchyIds (entry.getAccount()), i);
         }
         return map.values();
     }
-    private BigDecimal[] getChartBalances 
+    private BigDecimal[] getChartBalances
         (Journal journal, CompositeAccount acct, Date date, boolean inclusive, short[] layers, long maxId)
         throws HibernateException, GLException
     {
@@ -1597,13 +1867,15 @@ public class GLSession {
                 balance[0] = balance[0].subtract (b[0]);
                 balance[1] = balance[1].subtract (b[1]);
             } else {
-                throw new GLException ("Account " + a + " has wrong type");
+                // We allow undefined type on composite accounts now (i.e. "order" accounts).
+                // We don't add children balances.
+                // throw new GLException ("Account " + a + " has wrong type");
             }
             // session.evict (a);  FIXME this conflicts with r251 (cascade=evict genearting a failed to lazily initialize a collection
         }
         return balance;
     }
-    private Iterator findSummarizedGLEntries 
+    private Iterator findSummarizedGLEntries
         (Journal journal, Date start, Date end, boolean credit, short layer)
         throws HibernateException, GLException
     {
@@ -1671,16 +1943,7 @@ public class GLSession {
             sa[j] = new Short(i[j]);
         return sa;
     }
-    private String layersToString (short[] layers) {
-        StringBuffer sb = new StringBuffer();
-        Arrays.sort (layers);
-        for (int i=0; i<layers.length; i++) {
-            if (i>0)
-                sb.append ('.');
-            sb.append (Short.toString(layers[i]));
-        }
-        return sb.toString();
-    }
+
     private long getMaxGLEntryId () {
         Criteria crit = session.createCriteria (GLEntry.class);
         crit.addOrder (Order.desc ("id"));
@@ -1688,9 +1951,15 @@ public class GLSession {
         GLEntry entry = (GLEntry) crit.uniqueResult();
         return entry != null ? entry.getId() : 0L;
     }
+    private long getSafeMaxGLEntryId() {
+        return Math.max (getMaxGLEntryId()-SAFE_WINDOW, 0L);
+    }
+    public void overrideSafeWindow (long l) {
+        this.SAFE_WINDOW = l;
+    }
     private void recurseChildren (Account acct, List<Long> list) {
         for (Account a : acct.getChildren()) {
-            if (a instanceof FinalAccount)
+            if (a.isFinalAccount())
                 list.add (a.getId());
             else recurseChildren (a, list);
         }
@@ -1698,7 +1967,27 @@ public class GLSession {
     private List<Long> getChildren (Account acct) {
         List<Long> list = new ArrayList<Long>();
         recurseChildren (acct, list);
-        return list;        
+        return list;
+    }
+
+    private List<FinalAccount> getDeepFinalChildren0(Account acct) throws HibernateException, GLException {
+        List<FinalAccount> list = new ArrayList<>();
+        if (acct.getChildren() != null) {
+            for (Account a : acct.getChildren()) {
+                list.addAll(getDeepFinalChildren0(a));
+            }
+        } else if (acct instanceof FinalAccount) {
+            list.add((FinalAccount) acct);
+        }
+        return list;
+    }
+
+    private void validateAccountCode(Account parent, Account child)
+            throws GLException
+    {
+        if (!parent.isChart() && !child.getCode().startsWith(parent.getCode())) {
+            throw new GLException("Child account code `"+child.getCode()+"` must start with parent account code `"+parent.getCode()+"`");
+        }
     }
 
     public String toString() {
@@ -1714,4 +2003,18 @@ public class GLSession {
         }
     }
     */
+
+    private void setDialect() {
+        String ds = ("" + db.getDialect()).toLowerCase();
+        if (ds.contains("mysql"))
+            nativeDialect = NativeDialect.MYSQL;
+        else if (ds.contains("postgres"))
+            nativeDialect = NativeDialect.POSTGRESQL;
+    }
+    public void forceDialect (NativeDialect dialect) {
+        nativeDialect = dialect;
+    }
+    public enum NativeDialect {
+        MYSQL, POSTGRESQL, ORM
+    }
 }
